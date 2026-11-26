@@ -1,0 +1,386 @@
+name: Release
+
+on:
+  repository_dispatch:
+    types: [release]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref of TanCan1998/Soxu to build (tag or branch)'
+        required: true
+        type: string
+      version:
+        description: 'Semantic version without v prefix (e.g. 0.1.0)'
+        required: true
+        type: string
+      publish:
+        description: 'Publish GitHub release & update manifests (false = dry-run build)'
+        type: boolean
+        default: true
+
+env:
+  REF: ${{ github.event.client_payload.ref || github.event.inputs.ref }}
+  VERSION: ${{ github.event.client_payload.version || github.event.inputs.version }}
+  SHOULD_PUBLISH: ${{ github.event_name == 'repository_dispatch' && (github.event.client_payload.publish == null || github.event.client_payload.publish == true) || (github.event_name == 'workflow_dispatch' && inputs.publish) }}
+
+jobs:
+  linux:
+    name: Build & Smoke Test (linux-amd64)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 35
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout private source repository
+        uses: actions/checkout@v7
+        with:
+          repository: TanCan1998/Soxu
+          ssh-key: ${{ secrets.SOXU_DEPLOY_KEY }}
+          ref: ${{ env.REF }}
+
+      - name: Install Linux build dependencies (with mirror fallback)
+        timeout-minutes: 15
+        run: |
+          for i in 1 2 3; do
+            if [ "$i" = 2 ]; then
+              m=http://mirrors.edge.kernel.org/ubuntu
+              echo "Switching apt mirror to $m"
+              sudo sed -i -E "s#https?://[^ ]*(archive|security)\.ubuntu\.com/ubuntu#$m#g" /etc/apt/sources.list || true
+              sudo find /etc/apt/sources.list.d -name '*.sources' -exec sed -i -E "s#https?://[^ ]*(archive|security)\.ubuntu\.com/ubuntu#$m#g" {} + || true
+              if [ -f /etc/apt/apt-mirrors.txt ]; then echo "$m" | sudo tee /etc/apt/apt-mirrors.txt; fi
+            fi
+            sudo timeout 300 apt-get update -o Acquire::Retries=3 -o Acquire::http::Timeout=30 &&
+              sudo timeout 300 apt-get install -y --no-install-recommends -o DPkg::Lock::Timeout=60 -o Acquire::Retries=3 -o Acquire::http::Timeout=30 build-essential pkg-config libssl-dev curl && exit 0
+            echo "apt attempt $i failed; retrying..."
+            sleep 10
+          done
+          exit 1
+
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 12
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+          cache: 'pnpm'
+          cache-dependency-path: apps/mobile-web/pnpm-lock.yaml
+
+      - name: Build Mobile Web assets if present
+        run: |
+          if [ -f apps/mobile-web/package.json ]; then
+            pnpm -C apps/mobile-web install --frozen-lockfile
+            pnpm -C apps/mobile-web run build
+          fi
+
+      - name: Build release binaries
+        run: cargo build --release --locked -p soxu -p soxu-daemon
+
+      - name: Live binary & daemon smoke test
+        run: |
+          set -euo pipefail
+          tmp=$(mktemp -d)
+          trap 'pkill -f "$tmp" || true; rm -rf "$tmp"' EXIT
+          target/release/soxu --version
+          export HOME="$tmp/home"
+          mkdir -p "$HOME"
+          export SOXU_DATA_DIR="$tmp/data"
+          export SOXU_LISTEN="127.0.0.1:17698"
+          target/release/soxu-daemon > "$tmp/daemon.log" 2>&1 &
+          dpid=$!
+          ok=0
+          for i in $(seq 1 30); do
+            sleep 1
+            if curl -fsS http://127.0.0.1:17698/api/health >/dev/null 2>&1; then
+              ok=1
+              break
+            fi
+          done
+          if [ "$ok" != "1" ]; then
+            cat "$tmp/daemon.log" || true
+            echo "::error::soxu-daemon did not answer /api/health"
+            exit 1
+          fi
+          target/release/soxu --addr http://127.0.0.1:17698 status --json
+          kill "$dpid" || true
+          wait "$dpid" || true
+
+      - name: Package linux-amd64 archive
+        run: |
+          mkdir -p dist/stage
+          cp target/release/soxu target/release/soxu-daemon dist/stage/
+          tar -C dist/stage -czf dist/soxu-linux-amd64.tar.gz soxu soxu-daemon
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: build-linux-amd64
+          path: dist/soxu-linux-amd64.tar.gz
+          if-no-files-found: error
+
+  windows:
+    name: Build & Smoke Test (windows-amd64)
+    runs-on: windows-latest
+    timeout-minutes: 35
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout private source repository
+        uses: actions/checkout@v7
+        with:
+          repository: TanCan1998/Soxu
+          ssh-key: ${{ secrets.SOXU_DEPLOY_KEY }}
+          ref: ${{ env.REF }}
+
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 12
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+          cache: 'pnpm'
+          cache-dependency-path: apps/mobile-web/pnpm-lock.yaml
+
+      - name: Build Mobile Web assets if present
+        shell: pwsh
+        run: |
+          if (Test-Path apps/mobile-web/package.json) {
+            pnpm -C apps/mobile-web install --frozen-lockfile
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            pnpm -C apps/mobile-web run build
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+      - name: Build release binaries
+        run: cargo build --release --locked -p soxu -p soxu-daemon
+
+      - name: Live binary & daemon smoke test
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & target/release/soxu.exe --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $tmp = Join-Path $env:RUNNER_TEMP ("soxu-smoke-" + [Guid]::NewGuid().ToString('N'))
+          $data = Join-Path $tmp 'data'
+          $homeDir = Join-Path $tmp 'home'
+          New-Item -ItemType Directory -Path $data, $homeDir | Out-Null
+          $env:USERPROFILE = $homeDir
+          $env:SOXU_DATA_DIR = $data
+          $env:SOXU_LISTEN = '127.0.0.1:17698'
+          $logOut = Join-Path $tmp 'daemon.out.log'
+          $logErr = Join-Path $tmp 'daemon.err.log'
+          $proc = Start-Process -FilePath (Resolve-Path 'target/release/soxu-daemon.exe').Path -PassThru -RedirectStandardOutput $logOut -RedirectStandardError $logErr
+          try {
+            $ok = $false
+            foreach ($i in 1..30) {
+              Start-Sleep -Seconds 1
+              if ($proc.HasExited) { throw "soxu-daemon exited early with $($proc.ExitCode)" }
+              try {
+                Invoke-WebRequest -Uri 'http://127.0.0.1:17698/api/health' -UseBasicParsing | Out-Null
+                $ok = $true
+                break
+              } catch {}
+            }
+            if (-not $ok) {
+              Get-Content $logOut, $logErr -ErrorAction SilentlyContinue
+              throw 'soxu-daemon never answered /api/health'
+            }
+            & target/release/soxu.exe --addr http://127.0.0.1:17698 status --json
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } finally {
+            if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force }
+            Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Package windows-amd64 zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist/stage -Force | Out-Null
+          Copy-Item target/release/soxu.exe, target/release/soxu-daemon.exe dist/stage/
+          Compress-Archive -Path dist/stage/soxu.exe, dist/stage/soxu-daemon.exe -DestinationPath dist/soxu-windows-amd64.zip -Force
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: build-windows-amd64
+          path: dist/soxu-windows-amd64.zip
+          if-no-files-found: error
+
+  macos:
+    name: Build (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            arch: arm64
+            smoke: true
+          - target: x86_64-apple-darwin
+            arch: amd64
+            smoke: false
+    runs-on: macos-latest
+    timeout-minutes: 40
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout private source repository
+        uses: actions/checkout@v7
+        with:
+          repository: TanCan1998/Soxu
+          ssh-key: ${{ secrets.SOXU_DEPLOY_KEY }}
+          ref: ${{ env.REF }}
+
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 12
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+          cache: 'pnpm'
+          cache-dependency-path: apps/mobile-web/pnpm-lock.yaml
+
+      - name: Build Mobile Web assets if present
+        run: |
+          if [ -f apps/mobile-web/package.json ]; then
+            pnpm -C apps/mobile-web install --frozen-lockfile
+            pnpm -C apps/mobile-web run build
+          fi
+
+      - name: Build release binaries
+        run: cargo build --release --locked --target ${{ matrix.target }} -p soxu -p soxu-daemon
+
+      - name: Live binary smoke test (arm64 host)
+        if: matrix.smoke
+        run: |
+          set -euo pipefail
+          tmp=$(mktemp -d)
+          trap 'rm -rf "$tmp"' EXIT
+          BIN_DIR="target/${{ matrix.target }}/release"
+          "$BIN_DIR/soxu" --version
+          export HOME="$tmp/home"
+          mkdir -p "$HOME"
+          export SOXU_DATA_DIR="$tmp/data"
+          export SOXU_LISTEN="127.0.0.1:17698"
+          "$BIN_DIR/soxu-daemon" > "$tmp/daemon.log" 2>&1 &
+          dpid=$!
+          ok=0
+          for i in $(seq 1 30); do
+            sleep 1
+            if curl -fsS http://127.0.0.1:17698/api/health >/dev/null 2>&1; then
+              ok=1
+              break
+            fi
+          done
+          [ "$ok" = "1" ] || { cat "$tmp/daemon.log" || true; exit 1; }
+          "$BIN_DIR/soxu" --addr http://127.0.0.1:17698 status --json
+          kill "$dpid" || true
+          wait "$dpid" || true
+
+      - name: Package darwin archive
+        run: |
+          mkdir -p dist/stage
+          cp "target/${{ matrix.target }}/release/soxu" "target/${{ matrix.target }}/release/soxu-daemon" dist/stage/
+          tar -C dist/stage -czf "dist/soxu-darwin-${{ matrix.arch }}.tar.gz" soxu soxu-daemon
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: build-darwin-${{ matrix.arch }}
+          path: dist/soxu-darwin-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Checksums, Provenance, Publish & Update Manifests
+    needs: [linux, windows, macos]
+    if: env.SHOULD_PUBLISH == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        run: |
+          cd dist
+          sha256sum soxu-*.tar.gz soxu-*.zip > SHA256SUMS
+          ls -la
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/*
+
+      - name: Decide monotonic Latest mark
+        id: latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          make=$(bash scripts/latest.sh is-newest "$GITHUB_REPOSITORY" "v$VERSION")
+          echo "make=$make" >> "$GITHUB_OUTPUT"
+
+      - name: Create Release draft
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: v${{ env.VERSION }}
+          name: Soxu v${{ env.VERSION }}
+          draft: true
+          make_latest: ${{ steps.latest.outputs.make }}
+          generate_release_notes: true
+          files: dist/*
+
+      - name: Publish Release & verify monotonic Latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MAKE: ${{ steps.latest.outputs.make }}
+        run: |
+          gh release edit "v$VERSION" -R "$GITHUB_REPOSITORY" --draft=false --latest="$MAKE"
+          bash scripts/latest.sh mark "$GITHUB_REPOSITORY"
+
+      - name: Update Scoop, Homebrew & Winget manifests
+        if: (startsWith(env.REF, 'v') || startsWith(env.REF, 'refs/tags/v')) && steps.latest.outputs.make == 'true'
+        run: |
+          bash scripts/update-manifests.sh "$VERSION" dist/SHA256SUMS
+          git add bucket Formula winget
+          if git diff --cached --quiet; then
+            echo "Manifests already up to date for v$VERSION"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore: update scoop, homebrew and winget manifests for v$VERSION"
+          git push

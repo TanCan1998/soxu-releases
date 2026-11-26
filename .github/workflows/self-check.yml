@@ -1,0 +1,33 @@
+name: Self Check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scripts-and-manifests:
+    name: Verify Release Scripts & Manifest Generators
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check bash script syntax
+        run: bash -n scripts/latest.sh scripts/latest-test.sh scripts/update-manifests.sh
+
+      - name: Run latest.sh unit tests
+        run: bash scripts/latest-test.sh
+
+      - name: Run update-manifests self-check
+        run: bash scripts/update-manifests.sh --self-check
+
+      - name: Validate committed Scoop & Winget files if present
+        run: |
+          if [ -f bucket/soxu.json ]; then
+            python3 -m json.tool bucket/soxu.json >/dev/null
+          fi
