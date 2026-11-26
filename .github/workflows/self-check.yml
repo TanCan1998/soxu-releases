@@ -11,14 +11,19 @@ permissions:
 
 jobs:
   scripts-and-manifests:
-    name: Verify Release Scripts & Manifest Generators
-    runs-on: ubuntu-latest
+    name: Verify Release Scripts, Security Contracts & Manifests
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Check bash script syntax
-        run: bash -n scripts/latest.sh scripts/latest-test.sh scripts/update-manifests.sh
+        run: bash -n scripts/latest.sh scripts/latest-test.sh scripts/update-manifests.sh scripts/verify-workflow-security.sh
+
+      - name: Verify release workflow security contracts
+        run: bash scripts/verify-workflow-security.sh
 
       - name: Run latest.sh unit tests
         run: bash scripts/latest-test.sh

@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: 'Git ref of TanCan1998/Soxu to build (tag or branch)'
+        description: 'Official release tag of TanCan1998/Soxu (v<version> or refs/tags/v<version>)'
         required: true
         type: string
       version:
@@ -18,18 +18,23 @@ on:
         type: boolean
         default: true
 
+permissions:
+  contents: read
+
 jobs:
   resolve:
-    name: Resolve Release Inputs
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
+    name: Resolve & Verify Release Tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     outputs:
       ref: ${{ steps.resolve.outputs.ref }}
+      tag: ${{ steps.resolve.outputs.tag }}
       version: ${{ steps.resolve.outputs.version }}
+      commit_sha: ${{ steps.resolve.outputs.commit_sha }}
       should_publish: ${{ steps.resolve.outputs.should_publish }}
     steps:
-      - name: Resolve and validate release parameters
-        id: resolve
+      - name: Validate tag/version input allowlist
+        id: validate
         env:
           EVENT_NAME: ${{ github.event_name }}
           PAYLOAD_REF: ${{ github.event.client_payload.ref }}
@@ -41,48 +46,102 @@ jobs:
         run: |
           set -euo pipefail
           if [ "$EVENT_NAME" = "repository_dispatch" ]; then
-            ref="$PAYLOAD_REF"
-            version="$PAYLOAD_VERSION"
-            if [ -z "$PAYLOAD_PUBLISH" ] || [ "$PAYLOAD_PUBLISH" = "true" ]; then
-              should_publish="true"
-            else
+            raw_ref="$PAYLOAD_REF"
+            raw_version="$PAYLOAD_VERSION"
+            if [ "$PAYLOAD_PUBLISH" = "false" ]; then
               should_publish="false"
+            else
+              should_publish="true"
             fi
           else
-            ref="$INPUT_REF"
-            version="$INPUT_VERSION"
+            raw_ref="$INPUT_REF"
+            raw_version="$INPUT_VERSION"
             if [ "$INPUT_PUBLISH" = "true" ]; then
               should_publish="true"
             else
               should_publish="false"
             fi
           fi
-          version="${version#v}"
-          [ -n "$ref" ] || { echo "::error::Missing release ref"; exit 1; }
-          if [[ ! "$version" =~ ^[0-9][0-9A-Za-z.+-]*$ ]]; then
-            echo "::error::Invalid semantic version: $version"
+
+          version="${raw_version#v}"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Invalid semantic version: '$raw_version'"
             exit 1
           fi
-          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+          expected_tag="v$version"
+          expected_ref="refs/tags/$expected_tag"
+          norm_ref="${raw_ref#refs/tags/}"
+          if [ "$raw_ref" != "$expected_tag" ] && [ "$raw_ref" != "$expected_ref" ]; then
+            echo "::error::Unauthorized ref '$raw_ref' for version '$version'; only '$expected_tag' or '$expected_ref' is permitted."
+            exit 1
+          fi
+          if [ "$norm_ref" != "$expected_tag" ]; then
+            echo "::error::Normalized ref mismatch: '$norm_ref' != '$expected_tag'"
+            exit 1
+          fi
+
+          echo "tag=$expected_tag" >> "$GITHUB_OUTPUT"
+          echo "ref=$expected_ref" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "should_publish=$should_publish" >> "$GITHUB_OUTPUT"
-          echo "Resolved release: ref=$ref version=$version should_publish=$should_publish"
 
-  linux:
-    needs: resolve
-    name: Build & Smoke Test (linux-amd64)
-    runs-on: ubuntu-22.04
-    timeout-minutes: 35
-    env:
-      CARGO_TERM_COLOR: always
-      CARGO_INCREMENTAL: '0'
-    steps:
-      - name: Checkout private source repository
+      - name: Checkout official release tag metadata (sparse, no credentials persisted)
         uses: actions/checkout@v7
         with:
           repository: TanCan1998/Soxu
           ssh-key: ${{ secrets.SOXU_DEPLOY_KEY }}
-          ref: ${{ needs.resolve.outputs.ref }}
+          ref: ${{ steps.validate.outputs.ref }}
+          path: upstream
+          sparse-checkout: mise.toml
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Pin resolved upstream commit SHA
+        id: resolve
+        env:
+          TAG: ${{ steps.validate.outputs.tag }}
+          REF: ${{ steps.validate.outputs.ref }}
+          VERSION: ${{ steps.validate.outputs.version }}
+          SHOULD_PUBLISH: ${{ steps.validate.outputs.should_publish }}
+        run: |
+          set -euo pipefail
+          commit_sha=$(git -C upstream rev-parse --verify "HEAD^{commit}")
+          if [[ ! "$commit_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Failed to resolve 40-char commit SHA for $REF (got '$commit_sha')"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "commit_sha=$commit_sha" >> "$GITHUB_OUTPUT"
+          echo "should_publish=$SHOULD_PUBLISH" >> "$GITHUB_OUTPUT"
+          echo "Pinned release tag $REF -> $commit_sha (version=$VERSION, should_publish=$SHOULD_PUBLISH)"
+
+  linux:
+    needs: resolve
+    name: Build & Smoke Test (linux-amd64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout pinned source commit (no credentials persisted)
+        uses: actions/checkout@v7
+        with:
+          repository: TanCan1998/Soxu
+          ssh-key: ${{ secrets.SOXU_DEPLOY_KEY }}
+          ref: ${{ needs.resolve.outputs.commit_sha }}
+          persist-credentials: false
+
+      - name: Verify checked-out commit SHA matches resolved tag
+        env:
+          EXPECTED_SHA: ${{ needs.resolve.outputs.commit_sha }}
+        run: |
+          set -euo pipefail
+          actual_sha=$(git rev-parse HEAD)
+          [ "$actual_sha" = "$EXPECTED_SHA" ] || { echo "::error::SHA mismatch: $actual_sha != $EXPECTED_SHA"; exit 1; }
 
       - name: Install Linux build dependencies (with mirror fallback)
         timeout-minutes: 15
@@ -106,8 +165,6 @@ jobs:
         with:
           toolchain: stable
 
-      - uses: Swatinem/rust-cache@v2
-
       - uses: pnpm/action-setup@v6
         with:
           version: 12
@@ -115,8 +172,6 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: '26'
-          cache: 'pnpm'
-          cache-dependency-path: apps/mobile-web/pnpm-lock.yaml
 
       - name: Build Mobile Web assets if present
         run: |
@@ -167,29 +222,37 @@ jobs:
         with:
           name: build-linux-amd64
           path: dist/soxu-linux-amd64.tar.gz
+          retention-days: 1
           if-no-files-found: error
 
   windows:
     needs: resolve
     name: Build & Smoke Test (windows-amd64)
-    runs-on: windows-latest
-    timeout-minutes: 35
+    runs-on: windows-2025
+    timeout-minutes: 40
     env:
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: '0'
     steps:
-      - name: Checkout private source repository
+      - name: Checkout pinned source commit (no credentials persisted)
         uses: actions/checkout@v7
         with:
           repository: TanCan1998/Soxu
           ssh-key: ${{ secrets.SOXU_DEPLOY_KEY }}
-          ref: ${{ needs.resolve.outputs.ref }}
+          ref: ${{ needs.resolve.outputs.commit_sha }}
+          persist-credentials: false
+
+      - name: Verify checked-out commit SHA matches resolved tag
+        shell: pwsh
+        env:
+          EXPECTED_SHA: ${{ needs.resolve.outputs.commit_sha }}
+        run: |
+          $actual = (git rev-parse HEAD).Trim()
+          if ($actual -ne $env:EXPECTED_SHA) { throw "SHA mismatch: $actual != $env:EXPECTED_SHA" }
 
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: stable
-
-      - uses: Swatinem/rust-cache@v2
 
       - uses: pnpm/action-setup@v6
         with:
@@ -198,8 +261,6 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: '26'
-          cache: 'pnpm'
-          cache-dependency-path: apps/mobile-web/pnpm-lock.yaml
 
       - name: Build Mobile Web assets if present
         shell: pwsh
@@ -263,11 +324,12 @@ jobs:
         with:
           name: build-windows-amd64
           path: dist/soxu-windows-amd64.zip
+          retention-days: 1
           if-no-files-found: error
 
   macos:
     needs: resolve
-    name: Build (${{ matrix.arch }})
+    name: ${{ matrix.label }}
     strategy:
       fail-fast: false
       matrix:
@@ -275,30 +337,37 @@ jobs:
           - target: aarch64-apple-darwin
             arch: arm64
             smoke: true
+            label: Build & Native Smoke Test (darwin-arm64 on macos-15)
           - target: x86_64-apple-darwin
             arch: amd64
             smoke: false
-    runs-on: macos-latest
-    timeout-minutes: 40
+            label: Cross-Compile on arm64 Host (darwin-amd64, no native Intel smoke)
+    runs-on: macos-15
+    timeout-minutes: 45
     env:
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: '0'
     steps:
-      - name: Checkout private source repository
+      - name: Checkout pinned source commit (no credentials persisted)
         uses: actions/checkout@v7
         with:
           repository: TanCan1998/Soxu
           ssh-key: ${{ secrets.SOXU_DEPLOY_KEY }}
-          ref: ${{ needs.resolve.outputs.ref }}
+          ref: ${{ needs.resolve.outputs.commit_sha }}
+          persist-credentials: false
+
+      - name: Verify checked-out commit SHA matches resolved tag
+        env:
+          EXPECTED_SHA: ${{ needs.resolve.outputs.commit_sha }}
+        run: |
+          set -euo pipefail
+          actual_sha=$(git rev-parse HEAD)
+          [ "$actual_sha" = "$EXPECTED_SHA" ] || { echo "::error::SHA mismatch: $actual_sha != $EXPECTED_SHA"; exit 1; }
 
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
 
       - uses: pnpm/action-setup@v6
         with:
@@ -307,8 +376,6 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: '26'
-          cache: 'pnpm'
-          cache-dependency-path: apps/mobile-web/pnpm-lock.yaml
 
       - name: Build Mobile Web assets if present
         run: |
@@ -320,7 +387,7 @@ jobs:
       - name: Build release binaries
         run: cargo build --release --locked --target ${{ matrix.target }} -p soxu-cli -p soxu-daemon
 
-      - name: Live binary smoke test (arm64 host)
+      - name: Live binary smoke test (native arm64 host only)
         if: matrix.smoke
         run: |
           set -euo pipefail
@@ -347,6 +414,11 @@ jobs:
           kill "$dpid" || true
           wait "$dpid" || true
 
+      - name: Record cross-compile notice (amd64)
+        if: "!matrix.smoke"
+        run: |
+          echo "darwin-amd64 archive was cross-compiled for x86_64-apple-darwin on arm64 macos-15 host without native Intel execution."
+
       - name: Package darwin archive
         run: |
           mkdir -p dist/stage
@@ -357,16 +429,18 @@ jobs:
         with:
           name: build-darwin-${{ matrix.arch }}
           path: dist/soxu-darwin-${{ matrix.arch }}.tar.gz
+          retention-days: 1
           if-no-files-found: error
 
   publish:
     name: Checksums, Provenance, Publish & Update Manifests
     needs: [resolve, linux, windows, macos]
     if: needs.resolve.outputs.should_publish == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       REF: ${{ needs.resolve.outputs.ref }}
       VERSION: ${{ needs.resolve.outputs.version }}
+      COMMIT_SHA: ${{ needs.resolve.outputs.commit_sha }}
     timeout-minutes: 20
     permissions:
       contents: write
@@ -377,18 +451,37 @@ jobs:
       - uses: actions/checkout@v7
         with:
           ref: main
+          persist-credentials: false
 
-      - name: Download all platform artifacts
+      - name: Download expected platform artifacts
         uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
 
-      - name: Generate SHA256SUMS
+      - name: Verify allowlisted release assets & generate SHA256SUMS
         run: |
-          cd dist
-          sha256sum soxu-*.tar.gz soxu-*.zip > SHA256SUMS
-          ls -la
+          set -euo pipefail
+          expected=(
+            soxu-linux-amd64.tar.gz
+            soxu-windows-amd64.zip
+            soxu-darwin-arm64.tar.gz
+            soxu-darwin-amd64.tar.gz
+          )
+          for f in "${expected[@]}"; do
+            test -s "dist/$f" || { echo "::error::Missing expected release archive dist/$f"; exit 1; }
+          done
+          extra=$(find dist -maxdepth 1 -type f ! -name 'soxu-linux-amd64.tar.gz' ! -name 'soxu-windows-amd64.zip' ! -name 'soxu-darwin-arm64.tar.gz' ! -name 'soxu-darwin-amd64.tar.gz')
+          if [ -n "$extra" ]; then
+            echo "::error::Unexpected files in dist/: $extra"
+            exit 1
+          fi
+          (
+            cd dist
+            sha256sum soxu-linux-amd64.tar.gz soxu-windows-amd64.zip soxu-darwin-arm64.tar.gz soxu-darwin-amd64.tar.gz > SHA256SUMS
+            sha256sum -c SHA256SUMS
+            ls -la
+          )
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v4
@@ -422,8 +515,11 @@ jobs:
           bash scripts/latest.sh mark "$GITHUB_REPOSITORY"
 
       - name: Update Scoop, Homebrew & Winget manifests
-        if: (startsWith(needs.resolve.outputs.ref, 'v') || startsWith(needs.resolve.outputs.ref, 'refs/tags/v')) && steps.latest.outputs.make == 'true'
+        if: startsWith(needs.resolve.outputs.ref, 'refs/tags/v') && steps.latest.outputs.make == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           bash scripts/update-manifests.sh "$VERSION" dist/SHA256SUMS
           git add bucket Formula winget
           if git diff --cached --quiet; then
@@ -433,4 +529,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit -m "chore: update scoop, homebrew and winget manifests for v$VERSION"
-          git push
+          auth_b64=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')
+          git -c credential.helper= -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth_b64" push origin HEAD:main
