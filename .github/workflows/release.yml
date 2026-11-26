@@ -126,7 +126,7 @@ jobs:
           fi
 
       - name: Build release binaries
-        run: cargo build --release --locked -p soxu -p soxu-daemon
+        run: cargo build --release --locked -p soxu-cli -p soxu-daemon
 
       - name: Live binary & daemon smoke test
         run: |
@@ -212,7 +212,7 @@ jobs:
           }
 
       - name: Build release binaries
-        run: cargo build --release --locked -p soxu -p soxu-daemon
+        run: cargo build --release --locked -p soxu-cli -p soxu-daemon
 
       - name: Live binary & daemon smoke test
         shell: pwsh
@@ -318,7 +318,7 @@ jobs:
           fi
 
       - name: Build release binaries
-        run: cargo build --release --locked --target ${{ matrix.target }} -p soxu -p soxu-daemon
+        run: cargo build --release --locked --target ${{ matrix.target }} -p soxu-cli -p soxu-daemon
 
       - name: Live binary smoke test (arm64 host)
         if: matrix.smoke
