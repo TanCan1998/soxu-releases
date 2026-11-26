@@ -18,13 +18,58 @@ on:
         type: boolean
         default: true
 
-env:
-  REF: ${{ github.event.client_payload.ref || github.event.inputs.ref }}
-  VERSION: ${{ github.event.client_payload.version || github.event.inputs.version }}
-  SHOULD_PUBLISH: ${{ github.event_name == 'repository_dispatch' && (github.event.client_payload.publish == null || github.event.client_payload.publish == true) || (github.event_name == 'workflow_dispatch' && inputs.publish) }}
-
 jobs:
+  resolve:
+    name: Resolve Release Inputs
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      ref: ${{ steps.resolve.outputs.ref }}
+      version: ${{ steps.resolve.outputs.version }}
+      should_publish: ${{ steps.resolve.outputs.should_publish }}
+    steps:
+      - name: Resolve and validate release parameters
+        id: resolve
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PAYLOAD_REF: ${{ github.event.client_payload.ref }}
+          PAYLOAD_VERSION: ${{ github.event.client_payload.version }}
+          PAYLOAD_PUBLISH: ${{ github.event.client_payload.publish }}
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_PUBLISH: ${{ inputs.publish }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "repository_dispatch" ]; then
+            ref="$PAYLOAD_REF"
+            version="$PAYLOAD_VERSION"
+            if [ -z "$PAYLOAD_PUBLISH" ] || [ "$PAYLOAD_PUBLISH" = "true" ]; then
+              should_publish="true"
+            else
+              should_publish="false"
+            fi
+          else
+            ref="$INPUT_REF"
+            version="$INPUT_VERSION"
+            if [ "$INPUT_PUBLISH" = "true" ]; then
+              should_publish="true"
+            else
+              should_publish="false"
+            fi
+          fi
+          version="${version#v}"
+          [ -n "$ref" ] || { echo "::error::Missing release ref"; exit 1; }
+          if [[ ! "$version" =~ ^[0-9][0-9A-Za-z.+-]*$ ]]; then
+            echo "::error::Invalid semantic version: $version"
+            exit 1
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "should_publish=$should_publish" >> "$GITHUB_OUTPUT"
+          echo "Resolved release: ref=$ref version=$version should_publish=$should_publish"
+
   linux:
+    needs: resolve
     name: Build & Smoke Test (linux-amd64)
     runs-on: ubuntu-22.04
     timeout-minutes: 35
@@ -37,7 +82,7 @@ jobs:
         with:
           repository: TanCan1998/Soxu
           ssh-key: ${{ secrets.SOXU_DEPLOY_KEY }}
-          ref: ${{ env.REF }}
+          ref: ${{ needs.resolve.outputs.ref }}
 
       - name: Install Linux build dependencies (with mirror fallback)
         timeout-minutes: 15
@@ -125,6 +170,7 @@ jobs:
           if-no-files-found: error
 
   windows:
+    needs: resolve
     name: Build & Smoke Test (windows-amd64)
     runs-on: windows-latest
     timeout-minutes: 35
@@ -137,7 +183,7 @@ jobs:
         with:
           repository: TanCan1998/Soxu
           ssh-key: ${{ secrets.SOXU_DEPLOY_KEY }}
-          ref: ${{ env.REF }}
+          ref: ${{ needs.resolve.outputs.ref }}
 
       - uses: dtolnay/rust-toolchain@v1
         with:
@@ -220,6 +266,7 @@ jobs:
           if-no-files-found: error
 
   macos:
+    needs: resolve
     name: Build (${{ matrix.arch }})
     strategy:
       fail-fast: false
@@ -242,7 +289,7 @@ jobs:
         with:
           repository: TanCan1998/Soxu
           ssh-key: ${{ secrets.SOXU_DEPLOY_KEY }}
-          ref: ${{ env.REF }}
+          ref: ${{ needs.resolve.outputs.ref }}
 
       - uses: dtolnay/rust-toolchain@v1
         with:
@@ -314,9 +361,12 @@ jobs:
 
   publish:
     name: Checksums, Provenance, Publish & Update Manifests
-    needs: [linux, windows, macos]
-    if: env.SHOULD_PUBLISH == 'true'
+    needs: [resolve, linux, windows, macos]
+    if: needs.resolve.outputs.should_publish == 'true'
     runs-on: ubuntu-latest
+    env:
+      REF: ${{ needs.resolve.outputs.ref }}
+      VERSION: ${{ needs.resolve.outputs.version }}
     timeout-minutes: 20
     permissions:
       contents: write
@@ -372,7 +422,7 @@ jobs:
           bash scripts/latest.sh mark "$GITHUB_REPOSITORY"
 
       - name: Update Scoop, Homebrew & Winget manifests
-        if: (startsWith(env.REF, 'v') || startsWith(env.REF, 'refs/tags/v')) && steps.latest.outputs.make == 'true'
+        if: (startsWith(needs.resolve.outputs.ref, 'v') || startsWith(needs.resolve.outputs.ref, 'refs/tags/v')) && steps.latest.outputs.make == 'true'
         run: |
           bash scripts/update-manifests.sh "$VERSION" dist/SHA256SUMS
           git add bucket Formula winget
