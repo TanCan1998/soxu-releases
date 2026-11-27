@@ -15,7 +15,11 @@ selfcheck = (wf_dir / "self-check.yml").read_text(encoding="utf-8")
 errors = []
 
 for name, text in [("release.yml", release), ("self-check.yml", selfcheck)]:
-    for forbidden in ["rust-cache", "cache: 'pnpm'", 'cache: "pnpm"', "pull_request_target", "macos-latest", "ubuntu-22.04", "windows-latest"]:
+    # CI-D：发布链路禁止任何持久依赖缓存。主仓 CI 与发布仓共用 Actions 缓存服务，
+    # 一旦发布作业也挂载 Cargo/pnpm 缓存，遵循同一锁定键的构建就可能拿到不同源码树的
+    # 指纹产物。发布要么不缓存（本仓选择），要么使用可区分命名空间的 provider，
+    # 不得与主仓 CI 的 action 缓存混用。
+    for forbidden in ["rust-cache", "actions/cache", "cache: 'pnpm'", 'cache: "pnpm"', "SCCACHE", "sccache", "pull_request_target", "macos-latest", "ubuntu-22.04", "windows-latest"]:
         if forbidden in text:
             errors.append(f"{name}: forbidden pattern found: {forbidden}")
 
