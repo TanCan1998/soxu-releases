@@ -32,6 +32,11 @@ jobs:
       version: ${{ steps.resolve.outputs.version }}
       commit_sha: ${{ steps.resolve.outputs.commit_sha }}
       should_publish: ${{ steps.resolve.outputs.should_publish }}
+      # CI-D：工具链版本只从已核验源提交的 mise.toml 读取，三平台构建一律消费这四个输出。
+      rust_version: ${{ steps.toolchain.outputs.rust_version }}
+      node_version: ${{ steps.toolchain.outputs.node_version }}
+      pnpm_version: ${{ steps.toolchain.outputs.pnpm_version }}
+      mise_toml_sha256: ${{ steps.toolchain.outputs.mise_toml_sha256 }}
     steps:
       - name: Validate tag/version input allowlist
         id: validate
@@ -93,7 +98,10 @@ jobs:
           ssh-key: ${{ secrets.SOXU_DEPLOY_KEY }}
           ref: ${{ steps.validate.outputs.ref }}
           path: upstream
-          sparse-checkout: mise.toml
+          # 两者缺一即失败：mise.toml 是版本真相源，脚本是双仓共用的解析实现。
+          sparse-checkout: |
+            mise.toml
+            scripts
           fetch-depth: 1
           persist-credentials: false
 
@@ -117,6 +125,27 @@ jobs:
           echo "commit_sha=$commit_sha" >> "$GITHUB_OUTPUT"
           echo "should_publish=$SHOULD_PUBLISH" >> "$GITHUB_OUTPUT"
           echo "Pinned release tag $REF -> $commit_sha (version=$VERSION, should_publish=$SHOULD_PUBLISH)"
+
+      # CI-D：工具链版本以已核验源提交（commit_sha）里的 mise.toml 为唯一真相源。
+      # 不得改用主仓当前文件、未核验 tag 或本仓独立常量：那三种来源都会与真正的发布树漂移。
+      - name: Read locked toolchain versions from verified upstream mise.toml
+        id: toolchain
+        shell: pwsh
+        env:
+          MISE_TOML: upstream/mise.toml
+          MISE_READER: upstream/scripts/read-mise-versions.ps1
+          UPSTREAM_SHA: ${{ steps.resolve.outputs.commit_sha }}
+        run: |
+          if (-not (Test-Path -LiteralPath $env:MISE_TOML -PathType Leaf)) {
+            Write-Host "::error::核验提交 $($env:UPSTREAM_SHA) 未包含 mise.toml，无法确定锁定工具链"
+            exit 1
+          }
+          if (-not (Test-Path -LiteralPath $env:MISE_READER -PathType Leaf)) {
+            Write-Host "::error::核验提交 $($env:UPSTREAM_SHA) 未包含 scripts/read-mise-versions.ps1；只能对包含该脚本的官方 tag 发版"
+            exit 1
+          }
+          pwsh -NoProfile -File $env:MISE_READER -Path $env:MISE_TOML -GitHubOutput $env:GITHUB_OUTPUT
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   linux:
     needs: resolve
@@ -163,15 +192,22 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: stable
+          toolchain: ${{ needs.resolve.outputs.rust_version }}
 
       - uses: pnpm/action-setup@v6
         with:
-          version: 12
+          version: ${{ needs.resolve.outputs.pnpm_version }}
 
       - uses: actions/setup-node@v7
         with:
-          node-version: '26'
+          node-version: ${{ needs.resolve.outputs.node_version }}
+
+      # CI-D：action 参数写对不等于真的用上了这个版本，装完必须与核验过的 mise.toml 实测比对。
+      - name: Assert installed toolchain matches verified mise.toml
+        shell: pwsh
+        run: |
+          ./scripts/read-mise-versions.ps1 -AssertInstalled -AssertTools rust,node,pnpm
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Build Mobile Web assets if present
         run: |
@@ -252,15 +288,28 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: stable
+          toolchain: ${{ needs.resolve.outputs.rust_version }}
+
+      # CI-D：Windows 二进制同样必须与核验过的 mise.toml 实测一致。
+      - name: Assert installed Rust version matches verified mise.toml
+        shell: pwsh
+        run: |
+          ./scripts/read-mise-versions.ps1 -AssertInstalled -AssertTools rust
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - uses: pnpm/action-setup@v6
         with:
-          version: 12
+          version: ${{ needs.resolve.outputs.pnpm_version }}
 
       - uses: actions/setup-node@v7
         with:
-          node-version: '26'
+          node-version: ${{ needs.resolve.outputs.node_version }}
+
+      - name: Assert installed Node & pnpm match verified mise.toml
+        shell: pwsh
+        run: |
+          ./scripts/read-mise-versions.ps1 -AssertInstalled -AssertTools node,pnpm
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Build Mobile Web assets if present
         shell: pwsh
@@ -337,12 +386,17 @@ jobs:
           - target: aarch64-apple-darwin
             arch: arm64
             smoke: true
+            runner: macos-15
             label: Build & Native Smoke Test (darwin-arm64 on macos-15)
+          # CI-D：正式发布的 darwin-amd64 必须跑在原生 Intel Runner 上并做二进制冒烟，
+          # 不再用 arm64 宿主交叉编译后标注“未原生验证”。这与 CI 的 full-with-intel
+          # 测试证据是两条独立链路，互不代替。
           - target: x86_64-apple-darwin
             arch: amd64
-            smoke: false
-            label: Cross-Compile on arm64 Host (darwin-amd64, no native Intel smoke)
-    runs-on: macos-15
+            smoke: true
+            runner: macos-15-intel
+            label: Build & Native Smoke Test (darwin-amd64 on native Intel macos-15-intel)
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     env:
       CARGO_TERM_COLOR: always
@@ -366,16 +420,22 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: stable
+          toolchain: ${{ needs.resolve.outputs.rust_version }}
           targets: ${{ matrix.target }}
 
       - uses: pnpm/action-setup@v6
         with:
-          version: 12
+          version: ${{ needs.resolve.outputs.pnpm_version }}
 
       - uses: actions/setup-node@v7
         with:
-          node-version: '26'
+          node-version: ${{ needs.resolve.outputs.node_version }}
+
+      - name: Assert installed toolchain matches verified mise.toml
+        shell: pwsh
+        run: |
+          ./scripts/read-mise-versions.ps1 -AssertInstalled -AssertTools rust,node,pnpm
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Build Mobile Web assets if present
         run: |
@@ -387,7 +447,7 @@ jobs:
       - name: Build release binaries
         run: cargo build --release --locked --target ${{ matrix.target }} -p soxu-cli -p soxu-daemon
 
-      - name: Live binary smoke test (native arm64 host only)
+      - name: Live binary smoke test (native host)
         if: matrix.smoke
         run: |
           set -euo pipefail
@@ -413,11 +473,6 @@ jobs:
           "$BIN_DIR/soxu" --addr http://127.0.0.1:17698 status --json
           kill "$dpid" || true
           wait "$dpid" || true
-
-      - name: Record cross-compile notice (amd64)
-        if: "!matrix.smoke"
-        run: |
-          echo "darwin-amd64 archive was cross-compiled for x86_64-apple-darwin on arm64 macos-15 host without native Intel execution."
 
       - name: Package darwin archive
         run: |
